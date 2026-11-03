@@ -3,9 +3,6 @@ using AsyncFileScanner.Models;
 
 namespace AsyncFileScanner.Services;
 
-/// <summary>
-/// Основной сервис сканирования директории.
-/// </summary>
 public sealed class FileScanner
 {
     private readonly FileProbe _probe;
@@ -22,87 +19,162 @@ public sealed class FileScanner
         ValidateOptions(options);
 
         var stopwatch = Stopwatch.StartNew();
-        var results = new List<ScanResult>();
-        var errors = new List<string>();
 
-        int scannedFiles = 0;
-        long totalBytes = 0;
-
-        // Получаем все файлы рекурсивно
+        // Материализуем список файлов.
+        // Важно: EnumerateFiles ленивый, но для Task.WhenAll нам нужен готовый список.
         var files = Directory.EnumerateFiles(
             options.DirectoryPath,
             "*.*",
-            SearchOption.AllDirectories);
+            SearchOption.AllDirectories).ToList();
 
-        foreach (var filePath in files)
+        // Семафор ограничивает количество одновременных операций
+        using var semaphore = new SemaphoreSlim(options.MaxConcurrency);
+
+        // Счётчики для отслеживания реальной параллельности
+        int activeOperations = 0;
+        int maxObservedOperations = 0;
+
+        // Создаём задачи для каждого файла
+        var tasks = files.Select(async path =>
         {
-            // 1. Проверяем отмену перед каждой итерацией
-            if (cancellationToken.IsCancellationRequested)
-            {
-                break;
-            }
-
-            scannedFiles++;
-
-            // 2. Фильтрация по расширениям
-            var extension = Path.GetExtension(filePath).ToLowerInvariant();
-
-            // Если расширение не входит в список разрешенных, пропускаем файл
-            if (!options.Extensions.Contains(extension))
-            {
-                continue;
-            }
-
+            // Ждём, пока семафор разрешит войти
+            await semaphore.WaitAsync(cancellationToken);
             try
             {
-                // 3. Получаем информацию о файле для размера
-                var fileInfo = new FileInfo(filePath);
+                // Увеличиваем счётчик активных операций
+                int current = Interlocked.Increment(ref activeOperations);
 
-                // 4. Асинхронно "прощупываем" файл (читаем заголовок)
-                // Это нужно, чтобы убедиться, что файл доступен для чтения
-                await _probe.ReadHeaderAsync(filePath, cancellationToken);
+                // Обновляем максимум, если текущее значение больше
+                UpdateMax(ref maxObservedOperations, current);
 
-                // Если добрались сюда, файл доступен
-                var result = new ScanResult(
-                    FileName: Path.GetFileName(filePath),
-                    SizeInBytes: fileInfo.Length
-                );
-
-                results.Add(result);
-                totalBytes += fileInfo.Length;
+                try
+                {
+                    return await ProcessFileAsync(path, options, cancellationToken);
+                }
+                finally
+                {
+                    // Уменьшаем счётчик после обработки
+                    Interlocked.Decrement(ref activeOperations);
+                }
             }
-            catch (OperationCanceledException)
+            finally
             {
-                // Если отмена произошла внутри ReadHeaderAsync, пробрасываем её выше
-                throw;
+                // Освобождаем семафор в любом случае
+                semaphore.Release();
             }
-            catch (Exception ex)
-            {
-                // Ловим ошибки доступа (UnauthorizedAccessException) или IO ошибки
-                errors.Add($"Ошибка чтения '{filePath}': {ex.Message}");
-            }
-        }
+        });
+
+        // Ждём завершения всех задач
+        var allResults = await Task.WhenAll(tasks);
 
         stopwatch.Stop();
 
+        // Собираем итоговую статистику
+        var results = new List<ScanResult>();
+        var errors = new List<string>();
+        long totalBytes = 0;
+
+        foreach (var (result, error) in allResults)
+        {
+            if (error != null)
+            {
+                errors.Add(error);
+            }
+            else if (result != null)
+            {
+                results.Add(result);
+                totalBytes += result.SizeInBytes;
+            }
+        }
+
         return new ScanSummary(
-            scannedFiles,
+            files.Count,
             results.Count,
             totalBytes,
             stopwatch.Elapsed,
             results,
-            errors);
+            errors,
+            maxObservedOperations);
+    }
+
+    /// <summary>
+    /// Обработка одного файла: проверка размера и чтение заголовка.
+    /// Возвращает кортеж: (результат, ошибка).
+    /// </summary>
+    private async Task<(ScanResult? Result, string? Error)> ProcessFileAsync(
+        string path,
+        ScanOptions options,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Фильтр по расширению
+            var extension = Path.GetExtension(path).ToLowerInvariant();
+            if (!options.Extensions.Contains(extension))
+                return (null, null); // не подходит, но это не ошибка
+
+            var fileInfo = new FileInfo(path);
+            long size = fileInfo.Length;
+
+            // Фильтр по размеру
+            if (size < options.MinSizeBytes || size > options.MaxSizeBytes)
+                return (null, null); // не подходит по размеру
+
+            // Асинхронно читаем заголовок, чтобы проверить доступность
+            await _probe.ReadHeaderAsync(path, cancellationToken);
+
+            var result = new ScanResult(
+                FileName: Path.GetFileName(path),
+                SizeInBytes: size
+            );
+
+            return (result, null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // Отмену пробрасываем дальше
+        }
+        catch (Exception ex)
+        {
+            return (null, $"Ошибка чтения '{path}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Потокобезопасное обновление максимума через CompareExchange.
+    /// </summary>
+    private static void UpdateMax(ref int maxValue, int newValue)
+    {
+        while (true)
+        {
+            int observed = Volatile.Read(ref maxValue);
+            if (newValue <= observed) return;
+
+            // Пытаемся записать newValue, если maxValue всё ещё равен observed
+            if (Interlocked.CompareExchange(ref maxValue, newValue, observed) == observed)
+                return;
+            // Иначе кто-то успел изменить maxValue раньше — повторяем попытку
+        }
     }
 
     private static void ValidateOptions(ScanOptions options)
     {
         if (string.IsNullOrWhiteSpace(options.DirectoryPath))
-            throw new ArgumentException("Путь к директории не может быть пустым.", nameof(options.DirectoryPath));
+            throw new ArgumentException("Путь к директории не может быть пустым.");
 
         if (!Directory.Exists(options.DirectoryPath))
             throw new DirectoryNotFoundException($"Директория '{options.DirectoryPath}' не найдена.");
 
         if (options.Extensions == null || options.Extensions.Count == 0)
-            throw new ArgumentException("Список расширений не может быть пустым.", nameof(options.Extensions));
+            throw new ArgumentException("Список расширений не может быть пустым.");
+
+        if (options.MinSizeBytes < 0)
+            throw new ArgumentException("Минимальный размер не может быть отрицательным.");
+
+        if (options.MaxSizeBytes < options.MinSizeBytes)
+            throw new ArgumentException("Максимальный размер должен быть больше или равен минимальному.");
+
+        if (options.MaxConcurrency <= 0)
+            throw new ArgumentException("Количество одновременных операций должно быть больше 0.");
     }
 }

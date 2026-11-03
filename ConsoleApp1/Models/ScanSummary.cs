@@ -1,13 +1,13 @@
-﻿using System.Diagnostics; // Нужно для типа TimeSpan
+﻿using System.Diagnostics;
 
 namespace AsyncFileScanner.Models;
 
-// Здесь хранятся общие результаты сканирования.
 public sealed record ScanSummary(
     int TotalFilesScanned,
     int SuccessfulFiles,
     long TotalSizeBytes,
     TimeSpan ElapsedTime,
     List<ScanResult> Results,
-    List<string> Errors
+    List<string> Errors,
+    int MaxObservedConcurrency
 );
